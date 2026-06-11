@@ -1,138 +1,102 @@
 # MAPPO for Multi-Agent Drone Navigation
 
-This project implements a **Multi-Agent Proximal Policy Optimization (MAPPO)** algorithm designed to train a swarm of drones to navigate complex environments using **Unity ML-Agents**.
+This project implements **Multi-Agent Proximal Policy Optimization (MAPPO)** to train a swarm of drones to navigate complex environments built with **Unity ML-Agents**.
 
-The system utilizes a **Centralized Training, Decentralized Execution (CTDE)** architecture. Agents learn from a global state during training but act based solely on their local visual and vector observations during execution. To overcome sparse reward signals in navigation tasks, the agents are augmented with an **Intrinsic Curiosity Module (ICM)**.
+The system uses a **Centralized Training, Decentralized Execution (CTDE)** architecture: agents learn with a centralized critic that sees the global state, but act using only their local visual and vector observations. To counter sparse rewards, agents are augmented with an **Intrinsic Curiosity Module (ICM)** whose weight is annealed to zero during training.
 
-Additionally, the project includes a **Model Predictive Control (MPC)** baseline and tools for **Self-Supervised Pre-training** of the visual encoder.
+The project also includes an **MPC (MPPI) baseline** with a learned dynamics model, and **self-supervised contrastive pretraining** for the vision encoder.
 
 ## Key Features
 
-* **Algorithm:** MAPPO (Multi-Agent PPO) with Generalized Advantage Estimation (GAE).
-* **CTDE Architecture:** 
-    * **Actor (Decentralized):** Makes decisions based on local Camera (Visual) and Vector (Kinematic) data.
-    * **Critic (Centralized):** Estimates value based on the global state of all agents during training.
-* **Visual Perception:** Uses an **EfficientVisionEncoder** (based on MobileNet/EfficientNet concepts) with depthwise separable convolutions. Supports **pre-training** to improve feature extraction efficiency.
-* **Exploration:** Integrated **Curiosity Module** (Forward/Inverse dynamics models) to generate intrinsic rewards for exploring novel states.
-* **Curriculum Learning:** Supports a 4-stage curriculum to increase environmental difficulty based on success rates gradually.
-* **Baselines:** Includes an **MPC Agent** for control-theoretic performance comparison.
-* **Monitoring:** Integrated **Weights & Biases (WandB)** logging for real-time training metrics.
-
-***
+* **Algorithm:** MAPPO with Generalized Advantage Estimation (GAE), tanh-squashed Gaussian policy (with log-prob correction), KL-based early stopping, and advantage normalization.
+* **CTDE architecture:**
+    * **Actor (decentralized):** acts from local camera + vector observations; parameters shared across agents.
+    * **Critic (centralized):** per-agent value estimates from the concatenated observations of all agents.
+* **Visual perception:** a compact strided-CNN encoder (`EfficientVisionEncoder`). The encoder is **frozen during RL** — the rollout buffer stores encoded features, so it must be pretrained first (see below). Encoded observations are `[frozen visual features | raw vector obs]`; the actor/critic learn their own vector processing end-to-end.
+* **Exploration:** ICM (forward + inverse dynamics models) producing normalized, clipped intrinsic rewards, annealed to zero over the first 1M steps.
+* **Curriculum learning:** 4-stage curriculum with ascending success gates and a max-steps fallback per stage, so no stage can stall the run.
+* **Training health monitors:** the run aborts automatically if the policy entropy stays pinned at its maximum or the KL divergence indicates the policy has stopped moving — failure modes that previously wasted a full training run.
+* **Baseline:** MPPI-based MPC agent with a learned kinematic dynamics model.
+* **Monitoring:** Weights & Biases logging (`WANDB_PROJECT` / `WANDB_ENTITY` env vars).
 
 ## Project Structure
 
 ```text
 .
-├── MAPPO_train.ipynb               # Main training with Curriculum Learning
-├── MAPPO_train_no_curriculum.ipynb # Training without Curriculum Learning (Hard Mode)
-├── MCP_train.ipynb                 # Training/Evaluation loop for the MPC baseline
-├── PretrainFeatureExtraction.ipynb # Notebook for pre-training the Vision Encoder
-├── mappo_agent.py                  # MAPPO Agent logic (updates and interaction)
-├── MPC_Agent.py                    # Model Predictive Control (MPC) Agent logic
-├── models.py                       # PyTorch definitions for Actor and Critic networks
-├── curiosity.py                    # Intrinsic Curiosity Module (ICM) implementation
-├── rollout_buffer.py               # On-policy storage with GAE calculation
-├── vision_encoders.py              # CNN architectures for visual observation encoding
-├── environment.yml                 # Conda environment dependencies
-└── Env/                            # Directory containing Unity Environment builds
+├── MAPPO/
+│   ├── train.py                    # Canonical training entry point (curriculum + no-curriculum)
+│   ├── mappo_agent.py              # MAPPO agent (PPO update, checkpointing, config validation)
+│   ├── models.py                   # Actor (state-independent log_std) and centralized Critic
+│   ├── curiosity.py                # Intrinsic Curiosity Module (ICM)
+│   ├── rollout_buffer.py           # On-policy storage with GAE
+│   └── vision_encoders.py          # CNN encoder for visual observations
+├── MPC/
+│   └── MPC_Agent.py                # MPPI controller + learned dynamics baseline
+├── tests/                          # Unit + smoke tests (pytest, no Unity required)
+├── MAPPO_train.ipynb               # Thin driver notebook for MAPPO/train.py
+├── MPC_train.ipynb                 # Training/evaluation for the MPC baseline
+├── PretrainFeatureExtraction.ipynb # Contrastive pretraining of the vision encoder
+├── Old_Approach/                   # Earlier SAC + distillation approach (kept for reference)
+├── environment.yml                 # Pinned conda environment
+└── Env/                            # Unity environment builds (not in the repo; see below)
 ```
-
-## Architecture Details
-
-1. **The Agent**:
-    - **MAPPO Agent** (mappo_agent.py): The primary reinforcement learning agent. It fuses visual features (from the CNN) with vector data (velocity and distance to the target) via a projection layer. It manages the optimization of the Actor, Critic, Vision Encoder, and Curiosity module.
-    - **MPC Agent** (MPC_Agent.py): A non-learning baseline that uses Model Predictive Control (MPC) to optimize trajectory planning over a finite time horizon.
-2. **Neural Networks** (models.py):
-    - **Vision Encoder**: Processes (C, H, W) camera inputs. It can be trained end-to-end with the policy or pre-trained using `PretrainFeatureExtraction.ipynb` to learn robust visual representations before RL training begins.
-    - **Actor**: A Gaussian policy network that outputs continuous actions (tanh squashed).
-    - **Critic**: A centralized value network that takes the concatenated observations of all agents to predict state value.
-3. **Curiosity Module** (curiosity.py):
-    To prevent agents from getting stuck in local optima, the system uses an Intrinsic Curiosity Module (ICM).
-    - **Inverse Model**: Predicts the action taken given state $s_t$ and $s_{t+1}$.
-    - **Forward Model**: Predicts the next state representation given $s_t$ and action $a_t$.
-    - **Intrinsic Reward**: The prediction error of the forward model serves as the intrinsic reward.
 
 ## Installation
 
-Option 1: Conda (Recommended)
-
-Use the provided environment.yml to create a consistent environment:
-
 ```bash
 conda env create -f environment.yml
-conda activate ml-agents  # Or the name specified in the .yml file
+conda activate mappo_drone_rl
 ```
 
-Option 2: Pip
-
-Prerequisites: Python 3.8+ and the Unity ML-Agents Toolkit.
-
-Dependencies (example):
-```bash
-pip install torch numpy mlagents wandb
-```
-
-Environment setup: ensure your Unity environment builds are placed in the `./Env/` directory as referenced in the notebooks (for example, `./Env/Level1/DroneFlightv1`).
-
+**Unity environment builds** are not stored in the repo. Place your builds under `./Env/` matching the paths in `MAPPO/train.py` (e.g. `./Env/Level1/DroneFlightv1`). They must expose, per agent: a camera observation, vector observations (kinematics + raycasts, 92 dims), and a 4-dim continuous action space.
 
 ## Usage
 
-1. Pre-training (Optional but Recommended)
+### 1. Pretrain the vision encoder (required for useful visual features)
 
-Before training the RL agent, you can pre-train the vision encoder to recognize features in the environment without reward signals.
+The encoder is frozen during RL, so without pretraining the visual features are a fixed random projection.
 
-    Open PretrainFeatureExtraction.ipynb.
+Open `PretrainFeatureExtraction.ipynb` and run it. It pretrains the **same `EfficientVisionEncoder` architecture the agent uses** and verifies the checkpoint loads with `strict=True`. For best results, pretrain on frames collected from the Unity environment (`dataset_type="ImageFolder"`) rather than the CIFAR10 placeholder.
 
-    Run the cells to collect visual data from the Unity environment and train the encoder.
+### 2. Train MAPPO
 
-    The weights will be saved and loaded automatically by the MAPPO agent if configured.
-
-2. Train MAPPO
-
-There are two modes for training the MAPPO agent:
-
-    Curriculum Learning (Standard):
-    ```bash
-    jupyter notebook MAPPO_train.ipynb
-    ```
-Starts with simple tasks and progressively increases difficulty based on success rates.
-
-No Curriculum (Hard Mode):
 ```bash
-jupyter notebook MAPPO_train_no_curriculum.ipynb
+# With the 4-stage curriculum
+python -m MAPPO.train --curriculum --no-graphics
+
+# Without curriculum (directly on the target difficulty)
+python -m MAPPO.train --env-path ./Env/FinalLevel/DroneFlightv1 --no-graphics
+
+# Resume (restores steps, curriculum stage, optimizer, schedulers)
+python -m MAPPO.train --curriculum --resume saved_models_mappo/mappo_final.pth
 ```
-    Trains directly on the target environment's difficulty.
 
-3. Run MPC Baseline
+Run `python -m MAPPO.train --help` for all options (hyperparameters, save/log intervals, success threshold). Hyperparameters are validated strictly — unknown config keys raise instead of silently falling back to defaults.
 
-To evaluate the Model Predictive Control baseline:
+### 3. Run the MPC baseline
+
 ```bash
-jupyter notebook MCP_train.ipynb
+jupyter notebook MPC_train.ipynb
 ```
-4. Configuration
 
-Inside the notebooks, you can adjust the config dictionary to tune hyperparameters:
-```python
-config = {
-    'learning_rate': 3e-4,
-    'entropy_coef': 0.1,      # Higher for more exploration
-    'curiosity_coef': 0.1,    # Weight of intrinsic rewards
-    'rollout_length': 2048,   # Steps per update
-    'max_steps': 3_000_000,   # Total training steps
-    # ...
-}
+### 4. Run the tests
+
+```bash
+pytest tests/ -q
 ```
+
+The suite covers GAE math, log-prob consistency, encoder dimensions, config validation, checkpoint round-trips, and an end-to-end smoke test of two full collect→train cycles against a dummy environment. CI runs it on every push.
+
 ## Logging & Monitoring
 
-Training metrics are logged to Weights & Biases.
+Metrics are logged to Weights & Biases (`--no-wandb` to disable):
 
-    Policy Loss & Value Loss: Monitor convergence.
+* **Policy/value loss, entropy, approx. KL, clip fraction, explained variance** — convergence and update health
+* **Episode reward, success rate, episode length** — task performance
+* **Entropy coef, curiosity coef, learning rate** — schedule state
 
-    Entropy: Ensure the agent maintains exploration.
+The console log prints entropy alongside its theoretical maximum: entropy pinned at the max means the policy is pure noise, and the health monitor will abort the run rather than let it burn compute.
 
-    Episode Reward: The primary metric for success.
+## Status & history
 
-    Success Rate: Percentage of drones reaching the target.
-
-To disable logging, set USE_WANDB = False in the notebook.
+An earlier 2.39M-step training run (preserved in git history and W&B) reached only a 2% success rate; a post-mortem traced it to an oversized entropy bonus with an inverted adaptive scheduler, a curiosity module trained on temporally misaligned pairs, a vision-encoder checkpoint that silently failed to load, and a curriculum gate that could never trigger. All of these are fixed in the current code, which has not yet been validated with a full training run. Before investing GPU time, consider running ML-Agents' built-in POCA/PPO trainer on the same builds as a learnability control.

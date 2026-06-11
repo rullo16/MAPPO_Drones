@@ -1,0 +1,5 @@
+# CI/test dependencies (CPU-only). The Unity/ML-Agents stack needed for
+# actual training is defined in environment.yml.
+torch
+numpy
+pytest

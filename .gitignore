@@ -21,3 +21,5 @@ results/
 saved_models/
 saved_models_mappo/
 saved_models_mappo_no_curriculum/
+__pycache__/
+.pytest_cache/
