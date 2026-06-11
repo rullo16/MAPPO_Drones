@@ -1,31 +1,22 @@
 name: mappo_drone_rl
 channels:
-  # PyTorch channel for the latest stable releases
   - pytorch
-  # Common channel for machine learning and utility packages
   - conda-forge
   - defaults
 dependencies:
-  # Core Python Version
+  # Versions are pinned to a known-compatible combination.
+  # mlagents constrains numpy and protobuf, so loosen these with care.
   - python=3.10
-
-  # Fundamental Libraries
-  - numpy
+  - numpy=1.23.*
   - matplotlib
   - tqdm
-  
-  # PyTorch (will install CPU version by default)
-  - pytorch
-  - torchvision
-  - torchaudio
-
-  # Jupyter Notebook/Conda Setup
+  - pytorch=2.2.*
+  - torchvision        # used by PretrainFeatureExtraction.ipynb
   - ipykernel
+  - pytest>=7
   - pip
-
-  # Libraries best installed via pip (especially for ML-Agents and WandB)
   - pip:
-    # ML-Agents: Core library for interacting with the Unity environment
-    - mlagents
-    # Logging: Weights & Biases for experiment tracking
-    - wandb
+    # Unity ML-Agents python bindings (interacts with the env builds)
+    - mlagents==1.1.0
+    # Experiment tracking
+    - wandb==0.17.*
