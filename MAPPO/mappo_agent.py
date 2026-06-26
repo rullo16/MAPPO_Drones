@@ -18,6 +18,8 @@ Design notes:
   never silently fall back to a default.
 """
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -380,23 +382,38 @@ class MAPPOAgent:
 
     def save(self, path, extra=None):
         """Save full training state. `extra` is an arbitrary dict for
-        loop-level state (total_steps, curriculum stage, best reward, ...)."""
-        torch.save({
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
-            'vision_encoder': self.vision_encoder.state_dict(),
-            'curiosity_module': self.curiosity_module.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'update_count': self.update_count,
-            'intrinsic_normalizer': {
-                'mean': self.intrinsic_reward_normalizer.mean,
-                'var': self.intrinsic_reward_normalizer.var,
-                'count': self.intrinsic_reward_normalizer.count,
-            },
-            'config': self.config,
-            'extra': extra or {},
-        }, path)
+        loop-level state (total_steps, curriculum stage, best reward, ...).
+
+        Atomic: writes to a temp file and renames it over the target, so a
+        failed write (disk full, OneDrive/antivirus lock) can never corrupt
+        an existing checkpoint."""
+        path = str(path)
+        tmp_path = path + '.tmp'
+        try:
+            torch.save({
+                'actor': self.actor.state_dict(),
+                'critic': self.critic.state_dict(),
+                'vision_encoder': self.vision_encoder.state_dict(),
+                'curiosity_module': self.curiosity_module.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.scheduler.state_dict(),
+                'update_count': self.update_count,
+                'intrinsic_normalizer': {
+                    'mean': self.intrinsic_reward_normalizer.mean,
+                    'var': self.intrinsic_reward_normalizer.var,
+                    'count': self.intrinsic_reward_normalizer.count,
+                },
+                'config': self.config,
+                'extra': extra or {},
+            }, tmp_path)
+            os.replace(tmp_path, path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
         print(f"Model saved to {path}")
 
     def load(self, path):

@@ -15,6 +15,7 @@ The project also includes an **MPC (MPPI) baseline** with a learned dynamics mod
 * **Visual perception:** a compact strided-CNN encoder (`EfficientVisionEncoder`). The encoder is **frozen during RL** — the rollout buffer stores encoded features, so it must be pretrained first (see below). Encoded observations are `[frozen visual features | raw vector obs]`; the actor/critic learn their own vector processing end-to-end.
 * **Exploration:** ICM (forward + inverse dynamics models) producing normalized, clipped intrinsic rewards, annealed to zero over the first 1M steps.
 * **Curriculum learning:** 4-stage curriculum with ascending success gates and a max-steps fallback per stage, so no stage can stall the run.
+* **Independent per-agent episodes:** training drives the low-level ML-Agents API (`MAPPO/unity_env.py`) instead of the PettingZoo wrapper, so each drone's episode ends and respawns on its own — one drone crashing no longer resets the whole environment.
 * **Training health monitors:** the run aborts automatically if the policy entropy stays pinned at its maximum or the KL divergence indicates the policy has stopped moving — failure modes that previously wasted a full training run.
 * **Baseline:** MPPI-based MPC agent with a learned kinematic dynamics model.
 * **Monitoring:** Weights & Biases logging (`WANDB_PROJECT` / `WANDB_ENTITY` env vars).
@@ -25,6 +26,8 @@ The project also includes an **MPC (MPPI) baseline** with a learned dynamics mod
 .
 ├── MAPPO/
 │   ├── train.py                    # Canonical training entry point (curriculum + no-curriculum)
+│   ├── evaluate.py                 # Deterministic evaluation of a trained checkpoint
+│   ├── unity_env.py                # Low-level ML-Agents adapter (independent per-agent episodes)
 │   ├── mappo_agent.py              # MAPPO agent (PPO update, checkpointing, config validation)
 │   ├── models.py                   # Actor (state-independent log_std) and centralized Critic
 │   ├── curiosity.py                # Intrinsic Curiosity Module (ICM)
@@ -73,13 +76,28 @@ python -m MAPPO.train --curriculum --resume saved_models_mappo/mappo_final.pth
 
 Run `python -m MAPPO.train --help` for all options (hyperparameters, save/log intervals, success threshold). Hyperparameters are validated strictly — unknown config keys raise instead of silently falling back to defaults.
 
-### 3. Run the MPC baseline
+### 3. Evaluate a trained checkpoint
+
+Training curves include exploration noise; for reportable numbers, evaluate the policy deterministically (mean action, no exploration, no learning):
+
+```bash
+# One level
+python -m MAPPO.evaluate --checkpoint saved_models_mappo/mappo_best.pth \
+    --env-path ./Env/FinalLevel/DroneFlightv1 --num-episodes 200 --no-graphics
+
+# Every curriculum level
+python -m MAPPO.evaluate --checkpoint saved_models_mappo/mappo_best.pth --all-levels --no-graphics
+```
+
+It prints a results table (success rate, reward mean±std, episode length) and writes `eval_results.json`. The success definition matches training, so the numbers are directly comparable.
+
+### 4. Run the MPC baseline
 
 ```bash
 jupyter notebook MPC_train.ipynb
 ```
 
-### 4. Run the tests
+### 5. Run the tests
 
 ```bash
 pytest tests/ -q
@@ -97,6 +115,22 @@ Metrics are logged to Weights & Biases (`--no-wandb` to disable):
 
 The console log prints entropy alongside its theoretical maximum: entropy pinned at the max means the policy is pure noise, and the health monitor will abort the run rather than let it burn compute.
 
+## Results
+
+Deterministic evaluation, success rate (see `RESULTS.md` for the full table and discussion):
+
+| Method                               | Level 1 | Level 1.5 | Level 2 | FinalLevel |
+|--------------------------------------|:-------:|:---------:|:-------:|:----------:|
+| MPPI, learned dynamics               |   0%    |    —      |   —     |    0%      |
+| Proportional controller (privileged) |  100%   |   100%    |  100%   |   67%      |
+| **MAPPO (ours)**                     | **100%**| **100%**  |**100%** | **99.5%**  |
+
+MAPPO matches a privileged hand-tuned controller on open navigation and is the only method that also solves the cluttered FinalLevel (which the controller cannot, lacking obstacle sensing). Model-based MPPI fails — forward dynamics could not be learned in the egocentric, body-rotating observation frame.
+
 ## Status & history
 
-An earlier 2.39M-step training run (preserved in git history and W&B) reached only a 2% success rate; a post-mortem traced it to an oversized entropy bonus with an inverted adaptive scheduler, a curiosity module trained on temporally misaligned pairs, a vision-encoder checkpoint that silently failed to load, and a curriculum gate that could never trigger. All of these are fixed in the current code, which has not yet been validated with a full training run. Before investing GPU time, consider running ML-Agents' built-in POCA/PPO trainer on the same builds as a learnability control.
+The current code trains successfully: a 3M-step curriculum run reaches a ~100% success rate, progressing through all four curriculum stages (final level reached by ~800k steps) with episode length dropping to ~100 steps as drones learn to reach goals directly. The Unity-side (`Episode/Success`) and Python-side (`train/success_rate`) success metrics agree.
+
+This followed a substantial debugging effort. An earlier 2.39M-step run reached only 2% success; a post-mortem traced that to an oversized entropy bonus with an inverted adaptive scheduler, a curiosity module trained on temporally misaligned pairs, a vision-encoder checkpoint that silently failed to load, and a curriculum gate that could never trigger — all fixed. The decisive remaining issues were in the **environment and the env↔policy interface**: an asymmetric progress reward that paid more for advancing than it charged for retreating (so oscillating in place farmed reward without ever reaching the goal), a shared goal object in `EnvControllerLevel1` that interfered across drones, and use of the PettingZoo wrapper (which forces a global reset when any one agent's episode ends). The reward was made potential-based and symmetric, goals were made per-drone, and training now drives the low-level ML-Agents API for independent per-agent episodes.
+
+Suggested next steps: deterministic evaluation (`MAPPO.evaluate`), the MPC baseline, and ablations (curriculum vs none, curiosity on/off, pretrained vs random encoder) for comparison.

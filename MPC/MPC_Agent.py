@@ -34,7 +34,13 @@ class MPCConfig:
 
     # Dimensions
     full_state_dim: int = 92   # Full vector obs from Unity
-    kinematic_dim: int = 12    # Pos(3) + Vel(3) + Rot(3) + AngVel(3)
+    # The drone state lives in the LOCAL frame: the env observes
+    # [localGoalPos(3), rotationQuat(4), localVel(3), localAngVel(3), speed(1)]
+    # — there is NO world position. The MPC state is the first 13 of that
+    # block (speed scalar dropped); state[:3] is the goal offset in the
+    # drone's frame, so the planning target is always the ORIGIN.
+    kinematic_dim: int = 13
+    kinematic_offset: int = 0  # start of the state block inside the full vector obs
     action_dim: int = 4        # 4 continuous actions
     hidden_dim: int = 256
 
@@ -42,6 +48,12 @@ class MPCConfig:
     dynamics_lr: float = 1e-3
     dynamics_buffer_size: int = 100000
     dynamics_batch_size: int = 256
+
+    # Proportional-controller baseline gains (see ProportionalController).
+    # Translation gain is applied to the goal offset in METERS: 0.5 saturates
+    # the command at ~2 m, i.e. full speed toward the goal until ~2 m out.
+    p_gain_translation: float = 0.5
+    p_gain_yaw: float = 0.3
 
 class LearnedDynamicsModel(nn.Module):
     """
@@ -210,11 +222,13 @@ class MultiAgentMPC:
         
     def extract_kinematics(self, vector_obs):
         """
-        Extracts purely kinematic state (12 dims) from the larger Unity vector obs.
-        Assumes Unity Vector Obs structure: [Pos(3), Vel(3), Rot(3), AngVel(3), Raycasts...]
+        Extracts the drone-state block from the full Unity vector obs
+        (which also contains raycasts, whose position in the concatenation
+        is sensor-order dependent — set config.kinematic_offset from
+        UnityMultiAgentEnv.vector_block_slices).
         """
-        # Only take the first 12 floats
-        return vector_obs[:, :12]
+        o = self.config.kinematic_offset
+        return vector_obs[:, o:o + self.config.kinematic_dim]
 
     def get_actions(self, vector_obs, goals):
         """
@@ -222,22 +236,18 @@ class MultiAgentMPC:
         goals: (N, 3)
         """
         actions = []
-        kinematics = self.extract_kinematics(vector_obs) # (N, 12)
-        
-        # Extract just positions for collision avoidance sharing
-        current_positions = kinematics[:, :3]
-        
+        kinematics = self.extract_kinematics(vector_obs)  # (N, kinematic_dim)
+
         start_t = time.time()
-        
+
         for i in range(self.num_agents):
-            # Get positions of everyone else
-            mask = np.arange(self.num_agents) != i
-            others_pos = current_positions[mask]
-            
+            # NOTE: state[:3] is each drone's LOCAL goal offset, not a world
+            # position, so positions cannot be shared between drones for
+            # collision avoidance — the env does not observe world positions.
             action = self.controllers[i].get_action(
-                kinematics[i], 
-                goals[i], 
-                others_pos
+                kinematics[i],
+                goals[i],
+                None
             )
             actions.append(action)
             
@@ -247,13 +257,15 @@ class MultiAgentMPC:
 
     def update_dynamics(self, transitions):
         losses = []
+        o = self.config.kinematic_offset
+        d = self.config.kinematic_dim
         for t in transitions:
             # t is {agent_id: {state, action, next_state}}
             for i, data in t.items():
-                # Important: Only store Kinematics in buffer, not full obs
-                k_state = data['state'][:12]
-                k_next = data['next_state'][:12]
-                
+                # Important: Only store the kinematic block, not the full obs
+                k_state = data['state'][o:o + d]
+                k_next = data['next_state'][o:o + d]
+
                 self.controllers[i].buffer.add(k_state, data['action'], k_next)
                 
         for controller in self.controllers:
@@ -264,8 +276,79 @@ class MultiAgentMPC:
     
     def save(self, path):
         torch.save([c.dynamics.state_dict() for c in self.controllers], path)
-        
+
     def load(self, path):
         dicts = torch.load(path)
         for i, c in enumerate(self.controllers):
             c.dynamics.load_state_dict(dicts[i])
+
+
+class ProportionalController:
+    """
+    Privileged proportional controller for open goal-reaching.
+
+    Reads the goal direction directly from the observation (localGoalPos — the
+    goal expressed in the drone's own frame) and commands velocity straight
+    toward it, with a mild yaw term to face the goal. No model, no learning:
+    a correct, transparent classical reference. It has NO obstacle sensing, so
+    by construction it solves open levels and fails on cluttered ones — which
+    is exactly the comparison point we want against MAPPO.
+
+    Kinematic-block layout (Unity local frame, x=right, y=up, z=forward):
+        [0:3] localGoalPos / 50     (goal offset, normalized)
+        [3:7] rotation quaternion
+        [7:10] localVel / normalSpeed
+        [10:13] localAngVel / 5
+    Action layout (matches DroneAgentCamera.OnActionReceived):
+        [forward(+z), lateral(+x), ascent(+y), yaw]
+    """
+
+    def __init__(self, config: MPCConfig):
+        self.config = config
+
+    def get_action(self, state, goal=None):
+        # state[:3] is localGoalPos / 50; recover the offset in metres.
+        gx, gy, gz = state[0] * 50.0, state[1] * 50.0, state[2] * 50.0
+        kp = self.config.p_gain_translation
+        forward = np.clip(kp * gz, -1.0, 1.0)   # toward goal along local +z
+        lateral = np.clip(kp * gx, -1.0, 1.0)   # along local +x (right)
+        ascent = np.clip(kp * gy, -1.0, 1.0)    # along local +y (up)
+        # Turn to face the goal in the horizontal plane (gentle; translation
+        # already strafes toward the goal, so yaw is a refinement).
+        yaw = np.clip(self.config.p_gain_yaw * np.arctan2(gx, gz), -1.0, 1.0)
+        return np.array([forward, lateral, ascent, yaw], dtype=np.float32)
+
+
+class MultiAgentProportionalController:
+    """
+    Drop-in replacement for MultiAgentMPC exposing the same interface
+    (get_actions / update_dynamics / save / load), so the MPC notebook and
+    the per-level evaluation run unchanged. There is no dynamics model, so
+    update_dynamics is a no-op and the exploration/training phase can be
+    skipped entirely (set exploration_steps=0 or just call the eval directly).
+    """
+
+    def __init__(self, num_agents, config: MPCConfig):
+        self.num_agents = num_agents
+        self.config = config
+        self.controllers = [ProportionalController(config) for _ in range(num_agents)]
+
+    def extract_kinematics(self, vector_obs):
+        o = self.config.kinematic_offset
+        return vector_obs[:, o:o + self.config.kinematic_dim]
+
+    def get_actions(self, vector_obs, goals):
+        kinematics = self.extract_kinematics(vector_obs)  # (N, kinematic_dim)
+        start_t = time.time()
+        actions = [self.controllers[i].get_action(kinematics[i])
+                   for i in range(self.num_agents)]
+        return np.array(actions), {'solve_time': time.time() - start_t}
+
+    def update_dynamics(self, transitions):
+        return 0.0  # no model to train
+
+    def save(self, path):
+        torch.save({'config': self.config}, path)
+
+    def load(self, path):
+        pass

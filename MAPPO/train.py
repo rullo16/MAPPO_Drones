@@ -85,50 +85,6 @@ class FourStageCurriculum:
         return self.env_paths[self.current_stage - 1]
 
 
-def get_agent_obs(obs, agent, cam_key=1, vec_keys=(0, 2)):
-    """
-    Extract one agent's observation from the env dict.
-    Returns camera (CHW, float32 in [0,1]) and vector (1D float32).
-    """
-    data = obs[agent]
-    if isinstance(data, dict) and "observation" in data:
-        data = data["observation"]
-
-    if isinstance(data, dict) and ("camera_obs" in data and "vector_obs" in data):
-        cam = np.asarray(data["camera_obs"])
-        vec = np.asarray(data["vector_obs"]).reshape(-1)
-    else:
-        cam = np.asarray(data[cam_key])
-        v0 = np.asarray(data[vec_keys[0]]).reshape(-1)
-        v1 = np.asarray(data[vec_keys[1]]).reshape(-1)
-        vec = np.concatenate([v0, v1], axis=0)
-
-    if cam.ndim != 3:
-        raise AssertionError(f"Camera must be 3D, got {cam.shape}")
-    if cam.shape[-1] in (1, 3, 4):  # HWC -> CHW
-        cam = np.transpose(cam, (2, 0, 1))
-
-    cam = cam.astype(np.float32, copy=False)
-    if cam.max() > 1.5:  # uint8 range; normalize exactly once
-        cam = cam / 255.0
-
-    return cam, vec.astype(np.float32, copy=False)
-
-
-def gather_observations(obs_dict, agents, cam_shape, vec_shape):
-    """Stack per-agent observations; zero-fill (and report) missing agents."""
-    num_agents = len(agents)
-    camera_obs = np.zeros((num_agents, *cam_shape), dtype=np.float32)
-    vector_obs = np.zeros((num_agents, *vec_shape), dtype=np.float32)
-    missing = []
-    for i, agent_id in enumerate(agents):
-        if agent_id in obs_dict:
-            camera_obs[i], vector_obs[i] = get_agent_obs(obs_dict, agent_id)
-        else:
-            missing.append(agent_id)
-    return camera_obs, vector_obs, missing
-
-
 class TrainingHealthMonitor:
     """
     Watches for the failure modes that previously wasted a full training run:
@@ -169,6 +125,19 @@ class TrainingHealthMonitor:
         return None
 
 
+def prune_checkpoints(save_dir, keep):
+    """Delete all but the newest `keep` periodic checkpoints to bound disk
+    usage (best/final/stage checkpoints are never pruned)."""
+    if keep <= 0:
+        return
+    checkpoints = sorted(Path(save_dir).glob("mappo_checkpoint_*.pth"))
+    for old in checkpoints[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="MAPPO training")
     p.add_argument('--curriculum', action='store_true',
@@ -192,6 +161,13 @@ def parse_args():
                         'the target; keep in sync with the Unity reward code)')
     p.add_argument('--log-every', type=int, default=1)
     p.add_argument('--save-every', type=int, default=10)
+    p.add_argument('--keep-checkpoints', type=int, default=5,
+                   help='How many periodic checkpoints to retain (0 = all)')
+    p.add_argument('--reward-clip', type=float, default=DEFAULT_CONFIG['reward_clip'],
+                   help='Clip extrinsic rewards to +/- this for TRAINING. Keep it '
+                        'above the env\'s terminal success bonus, or the incentive '
+                        'to finish gets squashed relative to shaping reward. '
+                        '(Success DETECTION always uses raw rewards.)')
     # Hyperparameter overrides
     p.add_argument('--learning-rate', type=float, default=DEFAULT_CONFIG['learning_rate'])
     p.add_argument('--entropy-coef', type=float, default=DEFAULT_CONFIG['entropy_coef'])
@@ -204,8 +180,8 @@ def main():
     args = parse_args()
 
     # Imported here so the module is testable without Unity installed
-    from mlagents_envs.environment import UnityEnvironment as UE
-    from mlagents_envs.envs.unity_parallel_env import UnityParallelEnv as UPZBE
+    from mlagents_envs.side_channel.stats_side_channel import StatsSideChannel
+    from MAPPO.unity_env import UnityMultiAgentEnv
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -222,6 +198,7 @@ def main():
         'curiosity_coef': args.curiosity_coef,
         'rollout_length': args.rollout_length,
         'max_steps': args.max_steps,
+        'reward_clip': args.reward_clip,
     })
 
     save_dir = Path(args.save_dir)
@@ -236,21 +213,24 @@ def main():
         env_path = args.env_path or args.env_paths[-1]
 
     def open_env(path):
-        unity_env = UE(file_name=path, seed=args.seed, no_graphics=args.no_graphics)
-        wrapped = UPZBE(unity_env)
-        first_obs = wrapped.reset()
-        return wrapped, first_obs
+        # Consume the env's StatsRecorder side channel; without it,
+        # mlagents_envs warns "Unknown side channel data received" forever.
+        # UnityMultiAgentEnv drives the low-level API so each drone's
+        # episode ends and respawns INDEPENDENTLY — no global resets.
+        stats_channel = StatsSideChannel()
+        wrapped = UnityMultiAgentEnv(
+            file_name=path, seed=args.seed, no_graphics=args.no_graphics,
+            side_channels=[stats_channel])
+        return wrapped, stats_channel
 
     print(f"Loading Unity environment: {env_path}")
-    env, obs = open_env(env_path)
-    agents = sorted(env.agents)
-    num_agents = len(agents)
+    env, env_stats = open_env(env_path)
+    num_agents = env.num_agents
 
-    cam_shape = env.observation_space(agents[0])[1].shape
-    vec_dim = (env.observation_space(agents[0])[0].shape[0]
-               + env.observation_space(agents[0])[2].shape[0])
+    cam_shape = env.camera_shape
+    vec_dim = env.vector_dim
     vec_shape = (vec_dim,)
-    action_dim = env.action_space(agents[0]).shape[0]
+    action_dim = env.action_dim
 
     print(f"  Agents: {num_agents} | Camera: {cam_shape} | "
           f"Vector dim: {vec_dim} | Action dim: {action_dim}")
@@ -277,12 +257,20 @@ def main():
     # ---------------- Resume ----------------
     total_steps = 0
     num_updates = 0
+    # "Best" is selected by SUCCESS RATE (reward as tiebreak), not by training
+    # reward: training reward mixes exploration + curiosity/shaping and shifts
+    # scale between curriculum stages, so reward-best can freeze on a weak
+    # early-stage checkpoint while the policy keeps improving (observed: a
+    # reward-best checkpoint scored 0% deterministic while the final scored
+    # ~100%). Reset on curriculum advance so best reflects the hardest stage.
+    best_success = -float('inf')
     best_reward = -float('inf')
     if args.resume:
         extra = agent.load(args.resume)
         total_steps = extra.get('total_steps', 0)
         num_updates = extra.get('num_updates', agent.update_count)
         best_reward = extra.get('best_reward', -float('inf'))
+        best_success = extra.get('best_success', -float('inf'))
         if curriculum is not None and 'curriculum_stage' in extra:
             curriculum.current_stage = extra['curriculum_stage']
             curriculum.stage_start_step = extra.get('curriculum_stage_start_step', total_steps)
@@ -290,8 +278,7 @@ def main():
             if stage_path != env_path:
                 env.close()
                 env_path = stage_path
-                env, obs = open_env(env_path)
-                agents = sorted(env.agents)
+                env, env_stats = open_env(env_path)
         print(f"✓ Resumed at step {total_steps:,} (update {num_updates}, "
               f"best reward {best_reward:.2f})")
 
@@ -319,8 +306,11 @@ def main():
     episode_rewards = deque(maxlen=100)
     episode_lengths = deque(maxlen=100)
     episode_successes = deque(maxlen=100)
-    current_episode_reward = np.zeros(num_agents)
-    current_episode_length = 0
+    # Per-agent accumulators: agents reset INDEPENDENTLY inside Unity
+    # (EndEpisode respawns one drone while the others keep flying), so
+    # episodes are tracked per agent and the env is never globally reset.
+    agent_episode_reward = np.zeros(num_agents)
+    agent_episode_length = np.zeros(num_agents, dtype=np.int64)
     success_rate = 0.0
     curiosity_coef_initial = config['curiosity_coef']
 
@@ -329,11 +319,24 @@ def main():
             'total_steps': total_steps,
             'num_updates': num_updates,
             'best_reward': best_reward,
+            'best_success': best_success,
         }
         if curriculum is not None:
             extra['curriculum_stage'] = curriculum.current_stage
             extra['curriculum_stage_start_step'] = curriculum.stage_start_step
         return extra
+
+    def try_save(path):
+        """A failed checkpoint write (disk full, file lock) must not kill a
+        multi-hour training run; saves are atomic so nothing gets corrupted."""
+        try:
+            agent.save(path, extra=checkpoint_extra())
+            return True
+        except (RuntimeError, OSError) as e:
+            print(f"⚠️  Checkpoint save failed for {path}: {e}")
+            print(f"   Check free disk space (and OneDrive/antivirus locks on "
+                  f"the save dir). Training continues.")
+            return False
 
     print(f"Starting training: {config['max_steps']:,} steps, "
           f"rollout {config['rollout_length']}, "
@@ -341,7 +344,7 @@ def main():
 
     # Encode the initial observation once; each step reuses the previous
     # step's next-encoding, so the encoder runs once per new observation.
-    camera_obs, vector_obs, _ = gather_observations(obs, agents, cam_shape, vec_shape)
+    camera_obs, vector_obs = env.reset()
     encoded_obs = agent.encode_observations(camera_obs, vector_obs)
 
     try:
@@ -351,16 +354,19 @@ def main():
             if curriculum is not None and curriculum.should_advance(total_steps, success_rate):
                 stage = curriculum.current_stage
                 stage_ckpt = save_dir / f"mappo_stage{stage - 1}_checkpoint.pth"
-                agent.save(stage_ckpt, extra=checkpoint_extra())
+                try_save(stage_ckpt)
                 env.close()
                 env_path = curriculum.get_current_env_path()
                 print(f"\n=== Curriculum: advancing to stage {stage}: {env_path} ===\n")
-                env, obs = open_env(env_path)
-                agents = sorted(env.agents)
+                env, env_stats = open_env(env_path)
                 episode_successes.clear()  # stale stats must not chain advances
-                current_episode_reward = np.zeros(num_agents)
-                current_episode_length = 0
-                camera_obs, vector_obs, _ = gather_observations(obs, agents, cam_shape, vec_shape)
+                # Reset best tracking so mappo_best.pth reflects the new
+                # (harder) stage, not a high score from an easier one.
+                best_success = -float('inf')
+                best_reward = -float('inf')
+                agent_episode_reward[:] = 0.0
+                agent_episode_length[:] = 0
+                camera_obs, vector_obs = env.reset()
                 encoded_obs = agent.encode_observations(camera_obs, vector_obs)
 
             # Anneal curiosity weight to 0 over the first CURIOSITY_ANNEAL_STEPS
@@ -368,78 +374,74 @@ def main():
                 0.0, 1.0 - total_steps / CURIOSITY_ANNEAL_STEPS)
 
             # ================= COLLECTION =================
+            missing_obs_steps = 0
+            # Raw (pre-clip) step-reward extremes this rollout: directly
+            # answers "does any step reward ever exceed the success
+            # threshold?" when diagnosing a 0% success rate.
+            raw_reward_max = -float('inf')
+            raw_reward_min = float('inf')
             for _ in range(config['rollout_length']):
-                if not obs:
-                    obs = env.reset()
-                    agents = sorted(env.agents)
-                    camera_obs, vector_obs, _ = gather_observations(obs, agents, cam_shape, vec_shape)
-                    encoded_obs = agent.encode_observations(camera_obs, vector_obs)
-                    current_episode_reward = np.zeros(num_agents)
-                    current_episode_length = 0
-
                 actions, log_probs, values = agent.get_action(encoded_obs)
 
-                action_dict = {aid: act for aid, act in zip(agents, actions)}
-                next_obs, reward_dict, done_dict, _ = env.step(action_dict)
+                camera_next, vector_next, rewards, dones, interrupted, stale = env.step(actions)
 
-                rewards = np.array([reward_dict.get(a, 0.0) for a in agents])
-                dones = np.array([done_dict.get(a, False) for a in agents], dtype=np.float32)
-                current_episode_reward += rewards
+                agent_episode_reward += rewards
+                agent_episode_length += 1
+                raw_reward_max = max(raw_reward_max, float(rewards.max()))
+                raw_reward_min = min(raw_reward_min, float(rewards.min()))
 
                 train_rewards = np.clip(rewards, -config['reward_clip'], config['reward_clip'])
 
-                camera_next, vector_next, missing = gather_observations(
-                    next_obs, agents, cam_shape, vec_shape)
-                if missing:
-                    print(f"⚠️  Missing observations zero-filled for agents: {missing}")
+                if stale.any():
+                    # A slot produced no fresh decision within the adapter's
+                    # micro-step budget; its obs is the previous one. Should
+                    # be rare with synchronized DecisionRequesters.
+                    missing_obs_steps += 1
+                    if missing_obs_steps <= 3:
+                        print(f"⚠️  Stale observations for agent slots: "
+                              f"{np.flatnonzero(stale > 0.5).tolist()}")
+
                 encoded_next = agent.encode_observations(camera_next, vector_next)
 
+                # Per-agent dones are TRUE terminals: each drone respawns on
+                # its own inside Unity while the others keep flying — there
+                # is no global reset. GAE masks bootstraps per agent via the
+                # stored done flags. Intrinsic reward is masked at terminals
+                # (the "next" obs is the respawn state — its novelty is not
+                # signal) and at stale slots.
                 intrinsic = agent.compute_intrinsic_rewards(encoded_obs, encoded_next, actions)
-                total_rewards = train_rewards + intrinsic * agent.curiosity_coef
+                total_rewards = (train_rewards
+                                 + intrinsic * agent.curiosity_coef * (1.0 - dones) * (1.0 - stale))
 
-                episode_over = bool(dones.any()) or (len(done_dict) > 0 and all(done_dict.values()))
-
-                if episode_over:
-                    # The whole env resets, so every agent's trajectory ends
-                    # here. Agents that did NOT terminate are truncated: apply
-                    # the time-limit correction (bootstrap with V(s')) and
-                    # mark them done so GAE doesn't leak across the reset.
+                if interrupted.any():
+                    # ML-Agents flagged a built-in MaxStep interruption: a
+                    # truncation, not a true terminal — bootstrap with V(s').
                     next_values = agent.get_values(encoded_next)
-                    truncated = dones < 0.5
-                    total_rewards = total_rewards + truncated * config['gamma'] * next_values
-                    store_dones = np.ones_like(dones)
-                else:
-                    store_dones = dones
+                    total_rewards = total_rewards + interrupted * config['gamma'] * next_values
 
                 buffer.store(
                     obs=encoded_obs.cpu().numpy(),
                     next_obs=encoded_next.cpu().numpy(),
                     action=actions,
                     reward=total_rewards,
-                    done=store_dones,
+                    done=dones,
                     value=values,
                     log_prob=log_probs,
                 )
 
-                current_episode_length += 1
                 total_steps += 1
 
-                if episode_over:
-                    episode_rewards.append(current_episode_reward.mean())
-                    episode_lengths.append(current_episode_length)
-                    # Success proxy: any agent got the big terminal reward.
+                for i in np.flatnonzero(dones > 0.5):
+                    episode_rewards.append(float(agent_episode_reward[i]))
+                    episode_lengths.append(int(agent_episode_length[i]))
+                    # Success proxy: the terminal step carried the goal bonus
+                    # (env pays >= 20 on success).
                     episode_successes.append(
-                        float(np.any(rewards > args.success_reward_threshold)))
+                        float(rewards[i] > args.success_reward_threshold))
+                    agent_episode_reward[i] = 0.0
+                    agent_episode_length[i] = 0
 
-                    obs = env.reset()
-                    agents = sorted(env.agents)
-                    camera_obs, vector_obs, _ = gather_observations(obs, agents, cam_shape, vec_shape)
-                    encoded_obs = agent.encode_observations(camera_obs, vector_obs)
-                    current_episode_reward = np.zeros(num_agents)
-                    current_episode_length = 0
-                else:
-                    obs = next_obs
-                    encoded_obs = encoded_next
+                encoded_obs = encoded_next
 
             # ================= UPDATE =================
             last_values = agent.get_values(encoded_obs)
@@ -471,15 +473,24 @@ def main():
                 print(f"  KL divergence:   {train_stats['approx_kl']:8.4f}")
                 print(f"  Clip fraction:   {train_stats['clip_fraction']:8.1%}")
                 print(f"  Explained var:   {train_stats['explained_variance']:8.1%}")
+                print(f"  Step reward raw: [{raw_reward_min:.2f}, {raw_reward_max:.2f}]"
+                      f"  (success needs > {args.success_reward_threshold})")
+                if missing_obs_steps:
+                    print(f"  ⚠️  Mid-episode missing obs: {missing_obs_steps} steps this rollout")
 
                 if use_wandb:
                     import wandb
                     log = {f"train/{k}": v for k, v in train_stats.items()}
+                    # Unity-side StatsRecorder values (mean per rollout)
+                    for stat_key, stat_values in env_stats.get_and_reset_stats().items():
+                        log[f"env/{stat_key}"] = float(np.mean([v for v, _ in stat_values]))
                     log.update({
                         'train/reward_mean': mean_reward,
                         'train/success_rate': success_rate,
                         'train/episode_length': mean_length,
                         'train/total_steps': total_steps,
+                        'train/step_reward_raw_max': raw_reward_max,
+                        'train/step_reward_raw_min': raw_reward_min,
                     })
                     if curriculum is not None:
                         log['train/curriculum_stage'] = curriculum.current_stage
@@ -487,17 +498,21 @@ def main():
 
             # ---- Checkpoints ----
             if num_updates % args.save_every == 0:
-                agent.save(save_dir / f"mappo_checkpoint_{total_steps:08d}.pth",
-                           extra=checkpoint_extra())
+                if try_save(save_dir / f"mappo_checkpoint_{total_steps:08d}.pth"):
+                    prune_checkpoints(save_dir, args.keep_checkpoints)
 
-            if episode_rewards and mean_reward > best_reward:
+            # Best by success rate, with mean reward as tiebreak.
+            if episode_successes and (
+                    success_rate > best_success
+                    or (success_rate == best_success and mean_reward > best_reward)):
+                best_success = success_rate
                 best_reward = mean_reward
-                agent.save(save_dir / "mappo_best.pth", extra=checkpoint_extra())
+                try_save(save_dir / "mappo_best.pth")
 
     except KeyboardInterrupt:
         print(f"\nTraining interrupted at {total_steps:,} steps ({num_updates} updates)")
 
-    agent.save(save_dir / "mappo_final.pth", extra=checkpoint_extra())
+    try_save(save_dir / "mappo_final.pth")
     env.close()
     if use_wandb:
         import wandb

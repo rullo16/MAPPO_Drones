@@ -81,3 +81,22 @@ def test_gather_observations_zero_fills_missing():
     assert missing == ['b']
     assert cams[0].sum() > 0 and cams[1].sum() == 0
     assert vecs[1].sum() == 0
+
+
+def test_prune_checkpoints(tmp_path):
+    from MAPPO.train import prune_checkpoints
+    for i in range(8):
+        (tmp_path / f"mappo_checkpoint_{i:08d}.pth").write_bytes(b"x")
+    (tmp_path / "mappo_best.pth").write_bytes(b"x")
+    (tmp_path / "mappo_stage1_checkpoint.pth").write_bytes(b"x")
+
+    prune_checkpoints(tmp_path, keep=3)
+
+    remaining = sorted(p.name for p in tmp_path.glob("mappo_checkpoint_*.pth"))
+    assert remaining == [f"mappo_checkpoint_{i:08d}.pth" for i in (5, 6, 7)]
+    # best/stage checkpoints are never pruned
+    assert (tmp_path / "mappo_best.pth").exists()
+    assert (tmp_path / "mappo_stage1_checkpoint.pth").exists()
+
+    prune_checkpoints(tmp_path, keep=0)  # 0 = keep everything
+    assert len(list(tmp_path.glob("mappo_checkpoint_*.pth"))) == 3

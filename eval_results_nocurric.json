@@ -1,0 +1,40 @@
+{
+  "checkpoint": "saved_models_nocurric/mappo_final.pth",
+  "num_episodes": 200,
+  "seed": 123,
+  "success_reward_threshold": 15.0,
+  "results": {
+    "Level1": {
+      "episodes": 200,
+      "success_rate": 0.0,
+      "reward_mean": 24.139056101823225,
+      "reward_std": 19.27582931136305,
+      "length_mean": 166.1,
+      "length_std": 30.790258199631907
+    },
+    "Level1.5": {
+      "episodes": 200,
+      "success_rate": 0.0,
+      "reward_mean": 71.95459426636808,
+      "reward_std": 54.797577416786844,
+      "length_mean": 120.97,
+      "length_std": 78.04722352524784
+    },
+    "Level2": {
+      "episodes": 200,
+      "success_rate": 0.0,
+      "reward_mean": 10.650778778102248,
+      "reward_std": 9.92790640319906,
+      "length_mean": 110.045,
+      "length_std": 7.592297083228501
+    },
+    "FinalLevel": {
+      "episodes": 200,
+      "success_rate": 0.085,
+      "reward_mean": 13.351860350007192,
+      "reward_std": 13.278015765665016,
+      "length_mean": 32.135,
+      "length_std": 22.436505409711202
+    }
+  }
+}

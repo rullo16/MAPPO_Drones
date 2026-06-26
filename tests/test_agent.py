@@ -140,3 +140,20 @@ def test_checkpoint_round_trip(tmp_path, agent):
     for k, v in agent.critic.state_dict().items():
         assert torch.equal(fresh.critic.state_dict()[k], v)
     assert fresh.intrinsic_reward_normalizer.count == agent.intrinsic_reward_normalizer.count
+
+
+def test_save_is_atomic_no_tmp_left_and_old_file_survives_failure(tmp_path, agent, monkeypatch):
+    path = tmp_path / "ckpt.pth"
+    agent.save(path)
+    assert path.exists() and not (tmp_path / "ckpt.pth.tmp").exists()
+    good_bytes = path.read_bytes()
+
+    # Simulate a mid-write disk failure: the existing checkpoint must
+    # survive untouched and no .tmp file may linger.
+    def boom(*args, **kwargs):
+        raise RuntimeError("PytorchStreamWriter failed writing file")
+    monkeypatch.setattr(torch, "save", boom)
+    with pytest.raises(RuntimeError):
+        agent.save(path)
+    assert path.read_bytes() == good_bytes
+    assert not (tmp_path / "ckpt.pth.tmp").exists()

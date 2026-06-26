@@ -1,0 +1,40 @@
+{
+  "checkpoint": "saved_models_randenc/mappo_final.pth",
+  "num_episodes": 200,
+  "seed": 123,
+  "success_reward_threshold": 15.0,
+  "results": {
+    "Level1": {
+      "episodes": 200,
+      "success_rate": 1.0,
+      "reward_mean": 77.06280352093279,
+      "reward_std": 4.6031554542090145,
+      "length_mean": 38.08,
+      "length_std": 2.4069898213328615
+    },
+    "Level1.5": {
+      "episodes": 200,
+      "success_rate": 1.0,
+      "reward_mean": 164.93561367169022,
+      "reward_std": 1.6047258728012082,
+      "length_mean": 96.04,
+      "length_std": 0.7130217387990355
+    },
+    "Level2": {
+      "episodes": 200,
+      "success_rate": 1.0,
+      "reward_mean": 53.48549099679105,
+      "reward_std": 2.737087913000914,
+      "length_mean": 27.68,
+      "length_std": 5.4596336873457
+    },
+    "FinalLevel": {
+      "episodes": 200,
+      "success_rate": 0.865,
+      "reward_mean": 27.152643661322074,
+      "reward_std": 15.836486941662814,
+      "length_mean": 29.125,
+      "length_std": 9.728277082813792
+    }
+  }
+}
